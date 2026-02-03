@@ -7,12 +7,21 @@ include(FetchContent)
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+set(DOWNLOAD_URL "")
+
 FetchContent_Declare(
     rte_rrtmgp
     GIT_REPOSITORY https://github.com/NOAA-GFDL/rte-rrtmgp.git
     GIT_TAG pip_install
 )
 FetchContent_MakeAvailable(rte_rrtmgp)
+
+FetchContent_Declare(
+    rte_rrtmgp_data
+    URL https://github.com/earth-system-radiation/rrtmgp-data/archive/refs/tags/v1.9.tar.gz
+    SOURCE_DIR "$ENV{HOME}/.cache/pyrte_rrtmgp"
+)
+FetchContent_MakeAvailable(rte_rrtmgp_data)
 
 # Compile Python bindings with pybind11
 find_package(pybind11 REQUIRED)
