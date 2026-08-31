@@ -47,6 +47,11 @@ jobs:
           auto-activate: true
           activate-environment: pyrte_notebook_tests
           update-environment: false
+          extra-specs: |
+            python=${{ matrix.python-version }}
+            gfortran
+            c-compiler
+            cxx-compiler
 
       #
       # Check out repository under $GITHUB_WORKSPACE
