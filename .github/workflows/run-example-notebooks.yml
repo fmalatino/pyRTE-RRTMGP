@@ -52,6 +52,8 @@ jobs:
             gfortran
             c-compiler
             cxx-compiler
+            cmake
+            ninja
 
       #
       # Check out repository under $GITHUB_WORKSPACE
