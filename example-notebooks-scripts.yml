@@ -7,6 +7,8 @@ channels:
   - nodefaults
 dependencies:
   - python >=3.11
+  - c-compiler
+  - fortran-compiler
   - rte_rrtmgp
   - dask
   - typing_extensions
@@ -14,4 +16,3 @@ dependencies:
   - jupytext
   - cmake
   - ninja
-  - gfortran

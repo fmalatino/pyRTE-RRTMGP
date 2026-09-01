@@ -40,20 +40,9 @@ jobs:
         with:
           miniconda-version: "latest"
           python-version: ${{ matrix.python-version }}
-          use-mamba: true
-          conda-remove-defaults: true
           channels: conda-forge
           environment-file: example-notebooks-scripts.yml
-          auto-activate: true
-          activate-environment: pyrte_notebook_tests
-          update-environment: false
-          extra-specs: |
-            python=${{ matrix.python-version }}
-            gfortran
-            c-compiler
-            cxx-compiler
-            cmake
-            ninja
+          auto-activate-base: true
 
       #
       # Check out repository under $GITHUB_WORKSPACE
@@ -61,19 +50,10 @@ jobs:
       - name: Check out pyRTE
         uses: actions/checkout@v6
 
-      - name: Find gfortran on macOS
-        if: runner.os == 'macOS'
-        run: |
-          echo "$(brew --prefix)/opt/gcc/bin" >> $GITHUB_PATH
-
       - name: Install pyRTE
         run: |
-          echo `pwd`
           python -m pip install --upgrade pip
-          pip install -e . \
-            --config-settings=cmake.define.CMAKE_C_COMPILER=$CC \
-            --config-settings=cmake.define.CMAKE_CXX_COMPILER=$CXX \
-            --config-settings=cmake.define.CMAKE_Fortran_COMPILER=$FC
+          pip install -e .
 
       - name: Run pytest tests via CLI
         run: pyrte_rrtmgp run_tests
