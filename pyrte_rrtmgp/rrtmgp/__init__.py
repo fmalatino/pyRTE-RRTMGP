@@ -8,14 +8,10 @@ from typing import Dict, Final, Iterable, cast
 import dask.array as da
 import numpy as np
 import numpy.typing as npt
-import pandas as pd
+import scipy.constants as sc
 import xarray as xr
 
 from pyrte_rrtmgp.config import DEFAULT_GAS_MAPPING
-from pyrte_rrtmgp.input_mapping import (
-    AtmosphericMapping,
-    create_default_mapping,
-)
 from pyrte_rrtmgp.kernels.rrtmgp import (
     compute_cld_from_table,
     compute_planck_source,
@@ -23,34 +19,27 @@ from pyrte_rrtmgp.kernels.rrtmgp import (
     compute_tau_rayleigh,
     interpolation,
 )
-from pyrte_rrtmgp.rrtmgp_data_files import (
+from pyrte_rrtmgp.rte import OpticsTypes
+
+from .data_files import (
     CloudOpticsFiles,
     GasOpticsFiles,
     download_rrtmgp_data,
 )
-from pyrte_rrtmgp.rte import OpticsTypes
-from pyrte_rrtmgp.utils import safer_divide
+from .utils import safer_divide
 
-# Gravitational parameters from Helmert's equation (m/s^2)
-
-HELMERT1: Final[float] = 9.80665
-"""Standard gravity at sea level"""
-
-HELMERT2: Final[float] = 0.02586
-"""Gravity variation with latitude"""
+AVOGAD: Final[float] = sc.N_A
 
 # Molecular masses (kg/mol)
+#   In principle these should come from pyrte.utils but those
+#   values differ from the values used in RRTMGP by about 5e-5
+#   (relative) which makes comparison to Fortran versions fail.
 
 M_DRY: Final[float] = 0.028964
 """Dry air (molecular mass in kg/mol)"""
 
 M_H2O: Final[float] = 0.018016
 """Water vapor (molecular mass in kg/mol)"""
-
-# Avogadro's number (molecules/mol)
-
-AVOGAD: Final[float] = 6.02214076e23
-"""Avogadro's number (molecules/mol)"""
 
 logger = logging.getLogger(__name__)
 
@@ -166,27 +155,28 @@ class BaseGasOptics:
         Returns:
             DataArray containing gas columns including dry air
         """
-        pres_level_var = atmosphere.mapping.get_var("pres_level")
-
         gas_values = []
         for gas_map in gas_name_map.values():
             if gas_map in atmosphere.data_vars:
                 values = atmosphere[gas_map]
-                if hasattr(values, "units"):
-                    values = values * float(values.units)
                 if values.ndim == 0:
                     values = xr.full_like(
-                        atmosphere[pres_level_var].isel(level=0), values
+                        atmosphere["pres_level"].isel(level=0), values
                     )
             else:
-                values = xr.zeros_like(atmosphere[pres_level_var].isel(level=0))
+                values = xr.zeros_like(atmosphere["pres_level"].isel(level=0))
             gas_values.append(values)
 
         gas_da: xr.DataArray = xr.concat(
-            gas_values, dim=pd.Index(gas_name_map.keys(), name="gas"), coords="minimal"
+            gas_values,
+            dim=xr.DataArray(
+                [k for k in gas_name_map.keys()],
+                dims=["gas"],
+            ),
+            coords="minimal",
         )
 
-        col_dry = self.get_col_dry(gas_da.sel(gas="h2o"), atmosphere, latitude=None)
+        col_dry = self.get_col_dry(gas_da.sel(gas="h2o"), atmosphere)
 
         gas_da = gas_da * col_dry
         gas_da = xr.concat(
@@ -242,21 +232,19 @@ class BaseGasOptics:
             gas=gas_order
         )
 
-        layer_dim = atmosphere.mapping.get_dim("layer")
-
         npres = self._dataset.sizes["pressure"]
         ntemp = self._dataset.sizes["temperature"]
         ngas = gases_columns["gas"].size
-        nlay = atmosphere[layer_dim].size
+        nlay = atmosphere["layer"].size
         nflav = self.flavors_sets["flavor"].size
         neta = self._dataset["mixing_fraction"].size
 
-        play = atmosphere[atmosphere.mapping.get_var("pres_layer")]
-        tlay = atmosphere[atmosphere.mapping.get_var("temp_layer")]
+        play = atmosphere["pres_layer"]
+        tlay = atmosphere["temp_layer"]
         col_gas = gases_columns.sel(gas=gas_order)
 
         # Stack all non-core dimensions
-        stack_dims = [d for d in tlay.dims if d not in [layer_dim]]
+        stack_dims = [d for d in tlay.dims if d not in ["layer"]]
 
         # Ensure play has the same dimensions as tlay by expanding it if needed
         missing_dims = [d for d in tlay.dims if d not in play.dims]
@@ -297,24 +285,24 @@ class BaseGasOptics:
                 ["temperature"],  # temp_ref
                 [],  # press_ref_trop
                 ["atmos_layer", "absorber_ext", "temperature"],  # vmr_ref
-                [layer_dim],  # play
-                [layer_dim],  # tlay
-                [layer_dim, "gas"],  # col_gas
+                ["layer"],  # play
+                ["layer"],  # tlay
+                ["layer", "gas"],  # col_gas
             ],
             output_core_dims=[
-                [layer_dim],  # jtemp
+                ["layer"],  # jtemp
                 [
                     "eta_interp",
                     "press_interp",
                     "temp_interp",
-                    layer_dim,
+                    "layer",
                     "flavor",
                 ],  # fmajor
-                ["eta_interp", "temp_interp", layer_dim, "flavor"],  # fminor
-                ["temp_interp", layer_dim, "flavor"],  # col_mix
-                [layer_dim],  # tropo
-                ["pair", layer_dim, "flavor"],  # jeta
-                [layer_dim],  # jpress
+                ["eta_interp", "temp_interp", "layer", "flavor"],  # fminor
+                ["temp_interp", "layer", "flavor"],  # col_mix
+                ["layer"],  # tropo
+                ["pair", "layer", "flavor"],  # jeta
+                ["layer"],  # jpress
             ],
             dask_gufunc_kwargs={
                 "output_sizes": {
@@ -349,10 +337,6 @@ class BaseGasOptics:
             }
         )
 
-        interpolation_results.attrs["dataset_mapping"] = atmosphere.attrs[
-            "dataset_mapping"
-        ]
-
         return interpolation_results
 
     def tau_absorption(
@@ -367,9 +351,7 @@ class BaseGasOptics:
         Returns:
             Dataset containing absorption optical depth
         """
-        layer_dim = atmosphere.mapping.get_dim("layer")
-        level_dim = atmosphere.mapping.get_dim("level")
-        nlay = atmosphere[layer_dim].size
+        nlay = atmosphere["layer"].size
         ntemp = self._dataset["temperature"].size
         neta = self._dataset["mixing_fraction"].size
         npres = self._dataset["press_ref"].size
@@ -442,12 +424,12 @@ class BaseGasOptics:
 
         # Stack all non-core dimensions
         non_default_dims = [
-            d for d in atmosphere.dims if d not in [layer_dim, level_dim, "gpt", "bnd"]
+            d for d in atmosphere.dims if d not in ["layer", "level", "gpt", "bnd"]
         ]
 
         atmosphere = atmosphere.stack({"stacked_cols": non_default_dims})
-        play = atmosphere[atmosphere.mapping.get_var("pres_layer")]
-        tlay = atmosphere[atmosphere.mapping.get_var("temp_layer")]
+        play = atmosphere["pres_layer"]
+        tlay = atmosphere["temp_layer"]
 
         gas_interpolation_data = gas_interpolation_data.stack(
             {"stacked_cols": non_default_dims}
@@ -534,24 +516,24 @@ class BaseGasOptics:
                 ["minor_absorber_intervals_upper"],  # idx_minor_scaling_upper
                 ["minor_absorber_intervals_lower"],  # kminor_start_lower
                 ["minor_absorber_intervals_upper"],  # kminor_start_upper
-                [layer_dim],  # tropopause_mask
-                ["temp_interp", layer_dim, "flavor"],  # column_mix
+                ["layer"],  # tropopause_mask
+                ["temp_interp", "layer", "flavor"],  # column_mix
                 [
                     "eta_interp",
                     "press_interp",
                     "temp_interp",
-                    layer_dim,
+                    "layer",
                     "flavor",
                 ],  # fmajor
-                ["eta_interp", "temp_interp", layer_dim, "flavor"],  # fminor
-                [layer_dim],  # pres_layer
-                [layer_dim],  # temp_layer
-                [layer_dim, "gas"],  # gases_columns
-                ["pair", layer_dim, "flavor"],  # eta_index
-                [layer_dim],  # temperature_index
-                [layer_dim],  # pressure_index
+                ["eta_interp", "temp_interp", "layer", "flavor"],  # fminor
+                ["layer"],  # pres_layer
+                ["layer"],  # temp_layer
+                ["layer", "gas"],  # gases_columns
+                ["pair", "layer", "flavor"],  # eta_index
+                ["layer"],  # temperature_index
+                ["layer"],  # pressure_index
             ],
-            output_core_dims=[[layer_dim, "gpt"]],
+            output_core_dims=[["layer", "gpt"]],
             output_dtypes=[np.float64],
             dask="parallelized",
         )
@@ -680,46 +662,27 @@ class BaseGasOptics:
     def get_col_dry(
         vmr_h2o: xr.DataArray,
         atmosphere: xr.Dataset,
-        latitude: xr.DataArray | None = None,
     ) -> xr.DataArray:
         """Calculate the dry column of the atmosphere.
 
         Args:
             vmr_h2o: Water vapor volume mixing ratio
             atmosphere: Dataset containing atmospheric conditions
-            latitude: Latitude of the location
 
         Returns:
             DataArray containing dry column of the atmosphere
         """
-        level_dim = atmosphere.mapping.get_dim("level")
-        layer_dim = atmosphere.mapping.get_dim("layer")
-
-        non_default_dims = [
-            d for d in atmosphere.dims if d not in [level_dim, layer_dim]
-        ]
-
-        plev = atmosphere[atmosphere.mapping.get_var("pres_level")]
-
-        # Convert latitude to g0 DataArray
-        if latitude is not None:
-            g0 = xr.DataArray(
-                HELMERT1 - HELMERT2 * np.cos(2.0 * np.pi * latitude / 180.0),
-                dims=non_default_dims,
-                coords={d: atmosphere[d] for d in non_default_dims},
-            )
-        else:
-            g0 = xr.full_like(plev.isel(level=0), HELMERT1)
+        plev = atmosphere["pres_level"]
 
         # Calculate pressure difference between layers
-        delta_plev = np.abs(plev.diff(dim=level_dim)).rename({level_dim: layer_dim})
+        delta_plev = np.abs(plev.diff(dim="level")).rename({"level": "layer"})
 
         # Calculate factors using xarray operations
         fact = 1.0 / (1.0 + vmr_h2o)
         m_air = (M_DRY + M_H2O * vmr_h2o) * fact
 
         # Calculate col_dry using xarray operations
-        col_dry = 10.0 * delta_plev * AVOGAD * fact / (1000.0 * m_air * 100.0 * g0)
+        col_dry = 10.0 * delta_plev * AVOGAD * fact / (1000.0 * m_air * 100.0 * sc.g)
 
         return col_dry.rename("dry_air")
 
@@ -747,28 +710,24 @@ class BaseGasOptics:
 
         #  layer temperatures and pressures within temp_ref, press_ref
         #  level pressure differences > 0 (not implemented)
-        pres_layer_var = atmosphere.mapping.get_var("pres_layer")
         if (
-            atmosphere[pres_layer_var] < self.press_min + sys.float_info.epsilon
+            atmosphere["pres_layer"] < self.press_min + sys.float_info.epsilon
         ).any() or (
-            atmosphere[pres_layer_var] > self.press_max - sys.float_info.epsilon
+            atmosphere["pres_layer"] > self.press_max - sys.float_info.epsilon
         ).any():
             raise ValueError("Layer pressures outside valid range")
 
-        temp_layer_var = atmosphere.mapping.get_var("temp_layer")
         if (
-            atmosphere[temp_layer_var] < self.temp_min + sys.float_info.epsilon
+            atmosphere["temp_layer"] < self.temp_min + sys.float_info.epsilon
         ).any() or (
-            atmosphere[temp_layer_var] > self.temp_max - sys.float_info.epsilon
+            atmosphere["temp_layer"] > self.temp_max - sys.float_info.epsilon
         ).any():
             raise ValueError("Layer temperatures outside valid range")
 
-        pres_level_var = atmosphere.mapping.get_var("pres_level")
-        if (atmosphere[pres_level_var] < 0).any():
+        if (atmosphere["pres_level"] < 0).any():
             raise ValueError("Level pressures less than 0")
 
-        temp_level_var = atmosphere.mapping.get_var("temp_level")
-        if (atmosphere[temp_level_var] < 0).any():
+        if (atmosphere["temp_level"] < 0).any():
             raise ValueError("Level temperatures less than 0")
 
         return None
@@ -778,7 +737,6 @@ class BaseGasOptics:
         atmosphere: xr.Dataset,
         problem_type: OpticsTypes | None = None,
         gas_name_map: dict[str, str] | None = None,
-        variable_mapping: AtmosphericMapping | None = None,
         add_to_input: bool = True,
     ) -> xr.Dataset | None:
         """Compute gas optics for given atmospheric conditions.
@@ -787,7 +745,6 @@ class BaseGasOptics:
             atmosphere: Dataset containing atmospheric conditions
             problem_type: Type of radiative transfer problem to solve
             gas_name_map: Optional mapping between gas names and variable names
-            variable_mapping: Optional mapping for atmospheric variables
             add_to_input: Whether to add results to input dataset
 
         Returns:
@@ -812,27 +769,20 @@ class BaseGasOptics:
             k for k, v in gas_mapping.items() if v in list(atmosphere.data_vars)
         )
 
-        if variable_mapping is None:
-            variable_mapping = create_default_mapping()
-
-        # Set mapping in accessor
-        atmosphere.mapping.set_mapping(variable_mapping)
-
         self.validate_input_data(atmosphere, gas_mapping)
 
         # top_at_1 describes the ordering - is the first element in
         #   the layer dimension the top or bottom of the atmosphere?
-        pres_layer_var = atmosphere.mapping.get_var("pres_layer")
         top_at_1 = (
-            atmosphere[pres_layer_var].isel(layer=0)
-            - atmosphere[pres_layer_var].isel(layer=-1)
+            atmosphere["pres_layer"].isel(layer=0)
+            - atmosphere["pres_layer"].isel(layer=-1)
         )[0] < 0
 
         gas_interpolation_data = self.interpolate(atmosphere, gas_mapping)
         problem = self.compute_problem(atmosphere, gas_interpolation_data)
         sources = self.compute_sources(atmosphere, gas_interpolation_data)
         spectrum = self._dataset["bnd_limits_gpt"].to_dataset()
-        gas_optics = xr.merge([sources, problem, spectrum])
+        gas_optics = xr.merge([sources, problem, spectrum], compat="equals")
 
         if add_to_input:
             atmosphere.update(gas_optics)
@@ -841,7 +791,6 @@ class BaseGasOptics:
         else:
             output_ds = gas_optics
             output_ds.attrs["top_at_1"] = top_at_1
-            output_ds.mapping.set_mapping(variable_mapping)
             return output_ds
 
 
@@ -893,21 +842,13 @@ class LWGasOptics(BaseGasOptics):
             Dataset containing Planck source terms including surface, layer and level
               sources
         """
-        layer_dim = atmosphere.mapping.get_dim("layer")
-        level_dim = atmosphere.mapping.get_dim("level")
-
-        temp_layer_var = atmosphere.mapping.get_var("temp_layer")
-        temp_level_var = atmosphere.mapping.get_var("temp_level")
-        surface_temperature_var = atmosphere.mapping.get_var("surface_temperature")
-
         # Check if the top layer is at the first level
-        pres_layer_var = atmosphere.mapping.get_var("pres_layer")
         top_at_1 = (
-            atmosphere[pres_layer_var].values[0, 0]
-            < atmosphere[pres_layer_var].values[0, -1]
+            atmosphere["pres_layer"].values[0, 0]
+            < atmosphere["pres_layer"].values[0, -1]
         )
 
-        nlay = atmosphere.sizes[layer_dim]
+        nlay = atmosphere.sizes["layer"]
         nbnd = self._dataset.sizes["bnd"]
         ngpt = self._dataset.sizes["gpt"]
         nflav = self.flavors_sets.sizes["flavor"]
@@ -917,9 +858,7 @@ class LWGasOptics(BaseGasOptics):
         nPlanckTemp = self._dataset.sizes["temperature_Planck"]
 
         # stack non-default dims
-        non_default_dims = [
-            d for d in atmosphere.dims if d not in [layer_dim, level_dim]
-        ]
+        non_default_dims = [d for d in atmosphere.dims if d not in ["layer", "level"]]
 
         # stack gas interpolation data
         gas_interpolation_data = gas_interpolation_data.stack(
@@ -937,9 +876,9 @@ class LWGasOptics(BaseGasOptics):
             npres,
             ntemp,
             nPlanckTemp,
-            atmosphere[temp_layer_var],
-            atmosphere[temp_level_var],
-            atmosphere[surface_temperature_var],
+            atmosphere["temp_layer"],
+            atmosphere["temp_level"],
+            atmosphere["surface_temperature"],
             top_at_1,
             gas_interpolation_data["fmajor"],
             gas_interpolation_data["eta_index"],
@@ -961,21 +900,21 @@ class LWGasOptics(BaseGasOptics):
                 [],  # npres
                 [],  # ntemp
                 [],  # nPlanckTemp
-                [layer_dim],  # tlay
-                [level_dim],  # tlev
+                ["layer"],  # tlay
+                ["level"],  # tlev
                 [],  # tsfc
                 [],  # top_at_1
                 [
                     "eta_interp",
                     "press_interp",
                     "temp_interp",
-                    layer_dim,
+                    "layer",
                     "flavor",
                 ],  # fmajor
-                ["pair", layer_dim, "flavor"],  # jeta
-                [layer_dim],  # tropo
-                [layer_dim],  # jtemp
-                [layer_dim],  # jpress
+                ["pair", "layer", "flavor"],  # jeta
+                ["layer"],  # tropo
+                ["layer"],  # jtemp
+                ["layer"],  # jpress
                 ["pair", "bnd"],  # band_lims_gpt
                 ["temperature", "mixing_fraction", "pressure_interp", "gpt"],  # pfracin
                 [],  # temp_ref_min
@@ -985,8 +924,8 @@ class LWGasOptics(BaseGasOptics):
             ],
             output_core_dims=[
                 ["gpt"],  # sfc_src
-                [layer_dim, "gpt"],  # lay_source
-                [level_dim, "gpt"],  # lev_source
+                ["layer", "gpt"],  # lay_source
+                ["level", "gpt"],  # lev_source
                 ["gpt"],  # sfc_src_jac
             ],
             output_dtypes=[np.float64, np.float64, np.float64, np.float64],
@@ -1037,7 +976,7 @@ class SWGasOptics(BaseGasOptics):
             0.0,
         ).rename("ssa")
         g = xr.zeros_like(tau["tau"]).rename("g")
-        return xr.merge([tau, ssa, g])
+        return xr.merge([tau, ssa, g], compat="equals")
 
     def compute_sources(
         self,
@@ -1084,10 +1023,8 @@ class SWGasOptics(BaseGasOptics):
             # Scale solar source to default TSI
             toa_source = (solar_source * default_tsi * norm).rename("toa_source")
 
-            layer_dim = atmosphere.mapping.get_dim("layer")
-            level_dim = atmosphere.mapping.get_dim("level")
             non_default_dims = [
-                d for d in atmosphere.dims if d not in [layer_dim, level_dim, "gpt"]
+                d for d in atmosphere.dims if d not in ["layer", "level", "gpt"]
             ]
 
             # Ensure play has the same dimensions as tlay by expanding it if needed
@@ -1108,19 +1045,19 @@ class SWGasOptics(BaseGasOptics):
         # Combine upper and lower Rayleigh coefficients
         krayl = xr.concat(
             [self._dataset["rayl_lower"], self._dataset["rayl_upper"]],
-            dim=pd.Index(["lower", "upper"], name="rayl_bound"),
+            dim=xr.DataArray(
+                ["lower", "upper"],
+                dims=["rayl_bound"],
+            ),
         )
-
-        layer_dim = gas_interpolation_data.mapping.get_dim("layer")
-        level_dim = gas_interpolation_data.mapping.get_dim("level")
 
         non_default_dims = [
             d
             for d in gas_interpolation_data.dims
             if d
             not in [
-                level_dim,
-                layer_dim,
+                "level",
+                "layer",
                 "eta_interp",
                 "temp_interp",
                 "flavor",
@@ -1136,7 +1073,7 @@ class SWGasOptics(BaseGasOptics):
 
         tau_rayleigh = xr.apply_ufunc(
             compute_tau_rayleigh,
-            gas_interpolation_data.sizes[layer_dim],
+            gas_interpolation_data.sizes["layer"],
             self._dataset.sizes["bnd"],
             self._dataset.sizes["gpt"],
             gas_interpolation_data.sizes["gas"],
@@ -1167,14 +1104,14 @@ class SWGasOptics(BaseGasOptics):
                 ["pair", "bnd"],  # band_lims_gpt
                 ["temperature", "mixing_fraction", "gpt", "rayl_bound"],  # krayl
                 [],  # idx_h2o
-                [layer_dim],  # col_dry
-                [layer_dim, "gas"],  # col_gas
-                ["eta_interp", "temp_interp", layer_dim, "flavor"],  # fminor
-                ["pair", layer_dim, "flavor"],  # jeta
-                [layer_dim],  # tropo
-                [layer_dim],  # jtemp
+                ["layer"],  # col_dry
+                ["layer", "gas"],  # col_gas
+                ["eta_interp", "temp_interp", "layer", "flavor"],  # fminor
+                ["pair", "layer", "flavor"],  # jeta
+                ["layer"],  # tropo
+                ["layer"],  # jtemp
             ],
-            output_core_dims=[[layer_dim, "gpt"]],
+            output_core_dims=[["layer", "gpt"]],
             output_dtypes=[np.float64],
             dask="parallelized",
         )
@@ -1334,7 +1271,6 @@ class CloudOptics:
         cloud_properties: xr.Dataset,
         problem_type: str = "two-stream",
         add_to_input: bool = False,
-        variable_mapping: AtmosphericMapping | None = None,
     ) -> xr.Dataset:
         """
         Compute cloud optical properties for liquid and ice clouds.
@@ -1352,19 +1288,8 @@ class CloudOptics:
         """
         cloud_optics = self._ds
 
-        if variable_mapping is None:
-            variable_mapping = create_default_mapping()
-        # Set mapping in accessor
-        cloud_properties.mapping.set_mapping(variable_mapping)
-
-        layer_dim = cloud_properties.mapping.get_dim("layer")
-        lwp = cloud_properties.mapping.get_var("lwp")
-        iwp = cloud_properties.mapping.get_var("iwp")
-        rel = cloud_properties.mapping.get_var("rel")
-        rei = cloud_properties.mapping.get_var("rei")
-
         # Get dimensions
-        nlay = cloud_properties.sizes[layer_dim]
+        nlay = cloud_properties.sizes["layer"]
 
         non_default_dims = [
             d for d in cloud_properties.dims if d not in ["level", "layer", "gpt"]
@@ -1378,8 +1303,8 @@ class CloudOptics:
 
         # Sequentially process each chunk
         # Create cloud masks
-        liq_mask = cloud_properties[lwp] > 0
-        ice_mask = cloud_properties[iwp] > 0
+        liq_mask = cloud_properties["lwp"] > 0
+        ice_mask = cloud_properties["iwp"] > 0
 
         # Compute optical properties using lookup tables
         # Liquid phase
@@ -1392,8 +1317,8 @@ class CloudOptics:
             nlay,
             ngpt,
             liq_mask,
-            cloud_properties[lwp],
-            cloud_properties[rel],
+            cloud_properties["lwp"],
+            cloud_properties["rel"],
             cloud_optics.sizes["nsize_liq"],
             step_size.values,
             cloud_optics.radliq_lwr.values,
@@ -1403,9 +1328,9 @@ class CloudOptics:
             input_core_dims=[
                 [],  # nlay
                 [],  # ngpt
-                [layer_dim],  # liq_mask
-                [layer_dim],  # lwp
-                [layer_dim],  # rel
+                ["layer"],  # liq_mask
+                ["layer"],  # lwp
+                ["layer"],  # rel
                 [],  # nsize_liq
                 [],  # step_size
                 [],  # radliq_lwr
@@ -1414,9 +1339,9 @@ class CloudOptics:
                 ["nsize_liq", gpt_dim],  # asyliq
             ],
             output_core_dims=[
-                [layer_dim, gpt_out_dim],  # ltau
-                [layer_dim, gpt_out_dim],  # ltaussa
-                [layer_dim, gpt_out_dim],  # ltaussag
+                ["layer", gpt_out_dim],  # ltau
+                ["layer", gpt_out_dim],  # ltaussa
+                ["layer", gpt_out_dim],  # ltaussag
             ],
             output_dtypes=[np.float64, np.float64, np.float64],
             dask_gufunc_kwargs={
@@ -1438,8 +1363,8 @@ class CloudOptics:
             nlay,
             ngpt,
             ice_mask,
-            cloud_properties[iwp],
-            cloud_properties[rei],
+            cloud_properties["iwp"],
+            cloud_properties["rei"],
             cloud_optics.sizes["nsize_ice"],
             step_size.values,
             cloud_optics.diamice_lwr.values,
@@ -1449,9 +1374,9 @@ class CloudOptics:
             input_core_dims=[
                 [],  # nlay
                 [],  # ngpt
-                [layer_dim],  # ice_mask
-                [layer_dim],  # iwp
-                [layer_dim],  # rei
+                ["layer"],  # ice_mask
+                ["layer"],  # iwp
+                ["layer"],  # rei
                 [],  # nsize_ice
                 [],  # step_size
                 [],  # diamice_lwr
@@ -1460,9 +1385,9 @@ class CloudOptics:
                 ["nsize_ice", gpt_dim],  # asyice
             ],
             output_core_dims=[
-                [layer_dim, gpt_out_dim],  # itau
-                [layer_dim, gpt_out_dim],  # itaussa
-                [layer_dim, gpt_out_dim],  # itaussag
+                ["layer", gpt_out_dim],  # itau
+                ["layer", gpt_out_dim],  # itaussa
+                ["layer", gpt_out_dim],  # itaussag
             ],
             output_dtypes=[np.float64, np.float64, np.float64],
             dask_gufunc_kwargs={
@@ -1516,5 +1441,4 @@ class CloudOptics:
             cloud_properties.update(props)
             return
 
-        props.mapping.set_mapping(cloud_properties.mapping.mapping)
         return props

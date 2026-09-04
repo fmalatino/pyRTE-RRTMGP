@@ -12,12 +12,12 @@ on:
       - 'docs/**/*'
 
 jobs:
-  build:
+  run-tests:
     strategy:
       fail-fast: false
       matrix:
         platform: [ubuntu-latest, macos-14, macos-15-intel, macos-latest]
-        python-version: ["3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
         # when updating the tested Python versions, please also update README.md,
         # the conda.recipe/meta.yaml file, pyproject.toml, and (if necessary) the
         # .readthedocs.yaml file
@@ -33,10 +33,10 @@ jobs:
         shell: "bash -l {0}"
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install conda and dependencies
-        uses: conda-incubator/setup-miniconda@v3.3.0
+        uses: conda-incubator/setup-miniconda@v4.0.1
         with:
           miniconda-version: "latest"
           python-version: ${{ matrix.python-version }}
@@ -48,7 +48,7 @@ jobs:
       # Check out repository under $GITHUB_WORKSPACE
       #
       - name: Check out pyRTE
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install pyRTE
         run: |
