@@ -7,6 +7,9 @@ channels:
   - nodefaults
 dependencies:
   - python >=3.11,<3.15
+  - c-compiler
+  - cxx-compiler
+  - fortran-compiler
   - rte_rrtmgp
   - dask
   - numba>=0.64
